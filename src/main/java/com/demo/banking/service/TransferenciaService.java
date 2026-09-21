@@ -45,35 +45,33 @@ public class TransferenciaService {
         Cuenta cuentaOrigen = cuentaRepository.findById(cuentaOrigenId)
                 .orElseThrow(() -> new IllegalArgumentException("Cuenta origen inexistente: " + cuentaOrigenId));
 
-        // --- BUG SEMBRADO 2 (BOLA) ---
-        // Falta acá: si (!cuentaOrigen.getTitularUsuarioId().equals(usuarioAutenticadoId))
-        //   rechazar con 403 antes de seguir. Sin este chequeo, cualquier usuario
-        //   autenticado puede mover fondos de una cuenta que no es suya con solo
-        //   conocer su ID.
+        // FIX BUG 2 (BOLA): validar que el usuario autenticado sea el titular
+        if (!cuentaOrigen.getTitularUsuarioId().equals(usuarioAutenticadoId)) {
+            throw new SecurityException("Usuario no autorizado para operar sobre la cuenta: " + cuentaOrigenId);
+        }
 
         cuentaRepository.findById(cuentaDestinoId)
                 .orElseThrow(() -> new IllegalArgumentException("Cuenta destino inexistente: " + cuentaDestinoId));
 
         Instant inicioDelDia = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
 
-        // --- BUG SEMBRADO 1 (condición de carrera) ---
-        // "Leer total transferido hoy" y "escribir la nueva transferencia" son dos
-        // pasos separados, sin lock pesimista, sin retry optimista y sin constraint
-        // de base de datos que los ate. Bajo transferencias concurrentes sobre la
-        // misma cuenta, todas pueden leer el mismo total (todavía sin actualizar) y
-        // pasar el chequeo, superando el límite diario real en conjunto.
-        BigDecimal transferidoHoy = transferenciaRepository.sumaTransferidaDesde(cuentaOrigenId, inicioDelDia);
-        BigDecimal totalConEstaTransferencia = transferidoHoy.add(monto);
-        if (totalConEstaTransferencia.compareTo(cuentaOrigen.getLimiteDiario()) > 0) {
-            throw new LimiteDiarioExcedidoException(cuentaOrigenId, cuentaOrigen.getLimiteDiario(),
-                    totalConEstaTransferencia);
+        // FIX BUG 1 (condición de carrera): serializar lectura + validación + escritura
+        // usando synchronized con intern() para garantizar que threads sobre la misma
+        // cuenta origen comparten el mismo monitor (lock).
+        synchronized (cuentaOrigenId.intern()) {
+            BigDecimal transferidoHoy = transferenciaRepository.sumaTransferidaDesde(cuentaOrigenId, inicioDelDia);
+            BigDecimal totalConEstaTransferencia = transferidoHoy.add(monto);
+            if (totalConEstaTransferencia.compareTo(cuentaOrigen.getLimiteDiario()) > 0) {
+                throw new LimiteDiarioExcedidoException(cuentaOrigenId, cuentaOrigen.getLimiteDiario(),
+                        totalConEstaTransferencia);
+            }
+
+            cuentaOrigen.setSaldo(cuentaOrigen.getSaldo().subtract(monto));
+            cuentaRepository.save(cuentaOrigen);
+
+            Transferencia transferencia = new Transferencia(cuentaOrigenId, cuentaDestinoId, monto, Instant.now());
+            return transferenciaRepository.save(transferencia);
         }
-
-        cuentaOrigen.setSaldo(cuentaOrigen.getSaldo().subtract(monto));
-        cuentaRepository.save(cuentaOrigen);
-
-        Transferencia transferencia = new Transferencia(cuentaOrigenId, cuentaDestinoId, monto, Instant.now());
-        return transferenciaRepository.save(transferencia);
     }
 
     public static class LimiteDiarioExcedidoException extends RuntimeException {
