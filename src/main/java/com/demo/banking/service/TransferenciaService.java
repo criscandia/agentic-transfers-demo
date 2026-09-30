@@ -8,6 +8,7 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.util.concurrent.ConcurrentHashMap;
 import org.springframework.stereotype.Service;
 
 /**
@@ -33,6 +34,7 @@ public class TransferenciaService {
 
     private final CuentaRepository cuentaRepository;
     private final TransferenciaRepository transferenciaRepository;
+    private final ConcurrentHashMap<String, Object> cuentaLocks = new ConcurrentHashMap<>();
 
     public TransferenciaService(CuentaRepository cuentaRepository, TransferenciaRepository transferenciaRepository) {
         this.cuentaRepository = cuentaRepository;
@@ -45,35 +47,33 @@ public class TransferenciaService {
         Cuenta cuentaOrigen = cuentaRepository.findById(cuentaOrigenId)
                 .orElseThrow(() -> new IllegalArgumentException("Cuenta origen inexistente: " + cuentaOrigenId));
 
-        // --- BUG SEMBRADO 2 (BOLA) ---
-        // Falta acá: si (!cuentaOrigen.getTitularUsuarioId().equals(usuarioAutenticadoId))
-        //   rechazar con 403 antes de seguir. Sin este chequeo, cualquier usuario
-        //   autenticado puede mover fondos de una cuenta que no es suya con solo
-        //   conocer su ID.
+        // --- BUG CORREGIDO 2 (BOLA) ---
+        // Validar que la cuenta origen pertenece al usuario autenticado
+        if (!cuentaOrigen.getTitularUsuarioId().equals(usuarioAutenticadoId)) {
+            throw new SecurityException("Usuario no autorizado para operar sobre esta cuenta");
+        }
 
         cuentaRepository.findById(cuentaDestinoId)
                 .orElseThrow(() -> new IllegalArgumentException("Cuenta destino inexistente: " + cuentaDestinoId));
 
         Instant inicioDelDia = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
 
-        // --- BUG SEMBRADO 1 (condición de carrera) ---
-        // "Leer total transferido hoy" y "escribir la nueva transferencia" son dos
-        // pasos separados, sin lock pesimista, sin retry optimista y sin constraint
-        // de base de datos que los ate. Bajo transferencias concurrentes sobre la
-        // misma cuenta, todas pueden leer el mismo total (todavía sin actualizar) y
-        // pasar el chequeo, superando el límite diario real en conjunto.
-        BigDecimal transferidoHoy = transferenciaRepository.sumaTransferidaDesde(cuentaOrigenId, inicioDelDia);
-        BigDecimal totalConEstaTransferencia = transferidoHoy.add(monto);
-        if (totalConEstaTransferencia.compareTo(cuentaOrigen.getLimiteDiario()) > 0) {
-            throw new LimiteDiarioExcedidoException(cuentaOrigenId, cuentaOrigen.getLimiteDiario(),
-                    totalConEstaTransferencia);
+        // --- BUG CORREGIDO 1 (condición de carrera) ---
+        // Sincronizar el bloque crítico con lock granular por cuenta origen
+        synchronized (cuentaLocks.computeIfAbsent(cuentaOrigenId, k -> new Object())) {
+            BigDecimal transferidoHoy = transferenciaRepository.sumaTransferidaDesde(cuentaOrigenId, inicioDelDia);
+            BigDecimal totalConEstaTransferencia = transferidoHoy.add(monto);
+            if (totalConEstaTransferencia.compareTo(cuentaOrigen.getLimiteDiario()) > 0) {
+                throw new LimiteDiarioExcedidoException(cuentaOrigenId, cuentaOrigen.getLimiteDiario(),
+                        totalConEstaTransferencia);
+            }
+
+            cuentaOrigen.setSaldo(cuentaOrigen.getSaldo().subtract(monto));
+            cuentaRepository.save(cuentaOrigen);
+
+            Transferencia transferencia = new Transferencia(cuentaOrigenId, cuentaDestinoId, monto, Instant.now());
+            return transferenciaRepository.save(transferencia);
         }
-
-        cuentaOrigen.setSaldo(cuentaOrigen.getSaldo().subtract(monto));
-        cuentaRepository.save(cuentaOrigen);
-
-        Transferencia transferencia = new Transferencia(cuentaOrigenId, cuentaDestinoId, monto, Instant.now());
-        return transferenciaRepository.save(transferencia);
     }
 
     public static class LimiteDiarioExcedidoException extends RuntimeException {
