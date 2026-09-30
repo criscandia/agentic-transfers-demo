@@ -8,6 +8,8 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.util.HashMap;
+import java.util.Map;
 import org.springframework.stereotype.Service;
 
 /**
@@ -33,6 +35,7 @@ public class TransferenciaService {
 
     private final CuentaRepository cuentaRepository;
     private final TransferenciaRepository transferenciaRepository;
+    private final Map<String, Object> locksPorCuenta = new HashMap<>();
 
     public TransferenciaService(CuentaRepository cuentaRepository, TransferenciaRepository transferenciaRepository) {
         this.cuentaRepository = cuentaRepository;
@@ -45,35 +48,40 @@ public class TransferenciaService {
         Cuenta cuentaOrigen = cuentaRepository.findById(cuentaOrigenId)
                 .orElseThrow(() -> new IllegalArgumentException("Cuenta origen inexistente: " + cuentaOrigenId));
 
-        // --- BUG SEMBRADO 2 (BOLA) ---
-        // Falta acá: si (!cuentaOrigen.getTitularUsuarioId().equals(usuarioAutenticadoId))
-        //   rechazar con 403 antes de seguir. Sin este chequeo, cualquier usuario
-        //   autenticado puede mover fondos de una cuenta que no es suya con solo
-        //   conocer su ID.
+        // FIX BUG 2 (BOLA): validar que el usuario autenticado es el titular de la cuenta origen
+        if (!cuentaOrigen.getTitularUsuarioId().equals(usuarioAutenticadoId)) {
+            throw new SecurityException("Usuario " + usuarioAutenticadoId + " no es titular de la cuenta " + cuentaOrigenId);
+        }
 
         cuentaRepository.findById(cuentaDestinoId)
                 .orElseThrow(() -> new IllegalArgumentException("Cuenta destino inexistente: " + cuentaDestinoId));
 
-        Instant inicioDelDia = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
+        // FIX BUG 1 (condición de carrera): obtener o crear lock por cuenta origen
+        Object lock = getLockParaCuenta(cuentaOrigenId);
 
-        // --- BUG SEMBRADO 1 (condición de carrera) ---
-        // "Leer total transferido hoy" y "escribir la nueva transferencia" son dos
-        // pasos separados, sin lock pesimista, sin retry optimista y sin constraint
-        // de base de datos que los ate. Bajo transferencias concurrentes sobre la
-        // misma cuenta, todas pueden leer el mismo total (todavía sin actualizar) y
-        // pasar el chequeo, superando el límite diario real en conjunto.
-        BigDecimal transferidoHoy = transferenciaRepository.sumaTransferidaDesde(cuentaOrigenId, inicioDelDia);
-        BigDecimal totalConEstaTransferencia = transferidoHoy.add(monto);
-        if (totalConEstaTransferencia.compareTo(cuentaOrigen.getLimiteDiario()) > 0) {
-            throw new LimiteDiarioExcedidoException(cuentaOrigenId, cuentaOrigen.getLimiteDiario(),
-                    totalConEstaTransferencia);
+        // Sincronizar el chequeo del límite y la escritura de la transferencia
+        synchronized (lock) {
+            Instant inicioDelDia = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
+
+            BigDecimal transferidoHoy = transferenciaRepository.sumaTransferidaDesde(cuentaOrigenId, inicioDelDia);
+            BigDecimal totalConEstaTransferencia = transferidoHoy.add(monto);
+            if (totalConEstaTransferencia.compareTo(cuentaOrigen.getLimiteDiario()) > 0) {
+                throw new LimiteDiarioExcedidoException(cuentaOrigenId, cuentaOrigen.getLimiteDiario(),
+                        totalConEstaTransferencia);
+            }
+
+            cuentaOrigen.setSaldo(cuentaOrigen.getSaldo().subtract(monto));
+            cuentaRepository.save(cuentaOrigen);
+
+            Transferencia transferencia = new Transferencia(cuentaOrigenId, cuentaDestinoId, monto, Instant.now());
+            return transferenciaRepository.save(transferencia);
         }
+    }
 
-        cuentaOrigen.setSaldo(cuentaOrigen.getSaldo().subtract(monto));
-        cuentaRepository.save(cuentaOrigen);
-
-        Transferencia transferencia = new Transferencia(cuentaOrigenId, cuentaDestinoId, monto, Instant.now());
-        return transferenciaRepository.save(transferencia);
+    private Object getLockParaCuenta(String cuentaId) {
+        synchronized (locksPorCuenta) {
+            return locksPorCuenta.computeIfAbsent(cuentaId, k -> new Object());
+        }
     }
 
     public static class LimiteDiarioExcedidoException extends RuntimeException {
