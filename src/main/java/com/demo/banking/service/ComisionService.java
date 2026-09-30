@@ -1,6 +1,7 @@
 package com.demo.banking.service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import org.springframework.stereotype.Service;
 
 /**
@@ -20,12 +21,11 @@ import org.springframework.stereotype.Service;
 @Service
 public class ComisionService {
 
-    private static final double TASA_COMISION = 0.006;
+    private static final BigDecimal TASA_COMISION = new BigDecimal("0.006");
 
     public BigDecimal calcularComision(BigDecimal monto) {
-        // --- BUG SEMBRADO (precisión) ---
-        // double + Math.floor: pierde precisión y trunca en vez de redondear al centavo.
-        double comision = monto.doubleValue() * TASA_COMISION;
-        return BigDecimal.valueOf(Math.floor(comision * 100) / 100);
+        BigDecimal comision = monto.multiply(TASA_COMISION)
+                .divide(BigDecimal.ONE, 2, RoundingMode.HALF_UP);
+        return comision.setScale(2, RoundingMode.HALF_UP);
     }
 }
