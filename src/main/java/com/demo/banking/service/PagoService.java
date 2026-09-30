@@ -24,6 +24,7 @@ import org.springframework.stereotype.Service;
 public class PagoService {
 
     private final Map<String, BigDecimal> saldos = new ConcurrentHashMap<>();
+    private final Map<String, Comprobante> registroIdempotencia = new ConcurrentHashMap<>();
 
     public void abrirCuenta(String cuentaId, BigDecimal saldoInicial) {
         saldos.put(cuentaId, saldoInicial);
@@ -34,6 +35,11 @@ public class PagoService {
     }
 
     public Comprobante pagar(String claveIdempotencia, String cuentaId, BigDecimal monto) {
+        // Validar si la clave de idempotencia ya fue procesada
+        if (registroIdempotencia.containsKey(claveIdempotencia)) {
+            return registroIdempotencia.get(claveIdempotencia);
+        }
+
         BigDecimal saldoActual = saldos.get(cuentaId);
         if (saldoActual == null) {
             throw new IllegalArgumentException("Cuenta inexistente: " + cuentaId);
@@ -42,11 +48,14 @@ public class PagoService {
             throw new IllegalStateException("Saldo insuficiente en cuenta " + cuentaId);
         }
 
-        // --- BUG SEMBRADO (idempotencia) ---
-        // Falta acá: si esta claveIdempotencia ya se procesó, devolver el mismo
-        // comprobante de esa vez y NO volver a debitar.
+        // Realizar el débito
         saldos.put(cuentaId, saldoActual.subtract(monto));
-        return new Comprobante(UUID.randomUUID().toString(), cuentaId, monto);
+        
+        // Crear y registrar el comprobante para futuros reintentos
+        Comprobante comprobante = new Comprobante(UUID.randomUUID().toString(), cuentaId, monto);
+        registroIdempotencia.put(claveIdempotencia, comprobante);
+        
+        return comprobante;
     }
 
     public record Comprobante(String numero, String cuentaId, BigDecimal monto) {
